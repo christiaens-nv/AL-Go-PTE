@@ -1,5 +1,26 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/AL-Go-Actions/v8.2/.Modules/settings.schema.json",
   "type": "PTE",
-  "templateUrl": "https://github.com/microsoft/AL-Go-PTE@main"
+  "templateUrl": "https://github.com/microsoft/AL-Go-PTE@main",
+  "versioningStrategy": 2,
+  "DeployToBCBE-LIVE": {
+    "EnvironmentType": "Cloud",
+    "EnvironmentName": "BCBE-LIVE",
+    "Scope": "PTE",
+    "ContinuousDeployment": false,
+    "runs-on": "DOCKER001",
+    "Branches": [
+      "current_LIVE"
+    ]
+  },
+    "DeployToBCBE-UAT": {
+    "EnvironmentType": "Cloud",
+    "EnvironmentName": "BCBE-UAT",
+    "Scope": "PTE",
+    "ContinuousDeployment": false,
+    "runs-on": "DOCKER001",
+    "Branches": [
+      "current_UAT"
+    ]
+  }
 }
