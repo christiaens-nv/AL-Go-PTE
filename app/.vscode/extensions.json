@@ -1,0 +1,9 @@
+{
+	"recommendations": [
+		"stefanmaron.businesscentral-lintercop",
+        "mhutchie.git-graph",
+        "nabsolutions.nab-al-tools",
+        "vjeko.vjeko-al-objid",
+        "waldo.crs-al-language-extension"
+	]
+}

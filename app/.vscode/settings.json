@@ -1,0 +1,64 @@
+{
+    "files.autoSave": "onFocusChange",
+    "git.confirmSync": false,
+    "CRS.ObjectNamePrefix": "DNM ",    
+    "CRS.FileNamePattern": "<ObjectNameShort>.<ObjectTypeShortPascalCase>.al",        
+    "CRS.FileNamePatternExtensions": "<ObjectNameShort>.<ObjectTypeShortPascalCase>.al",
+    "CRS.RemovePrefixFromFilename": true,
+    "CRS.OnSaveAlFileAction": "Rename",
+    "al.assemblyProbingPaths": [
+        "./.netpackages",
+        "c:/Windows/assembly/"
+    ],
+    "alOutline.codeActionsOnSave": [
+        "SortProperties",
+        "SortTableFields",
+        "SortReportColumns",
+        "SortProcedures",
+        "SortTriggers",
+        "SortVariables",
+        "SortPermissions",
+        "SortPermissionSetList",
+        "SortCustomizations",
+        "SortUsings",
+        "OneStatementPerLine",
+        "FormatDocument"
+    ],
+    "alOutline.codeCleanupActions":  [
+        "RemoveWithStatements",
+        "RemoveEmptyTriggers",
+        "RemoveEmptyLines",
+        "RemoveEmptySections",
+        "RemoveStrSubstNoFromError",
+        "AddApplicationAreas",
+        "AddTableFieldCaptions",
+        "AddObjectCaptions",
+        "FixKeywordsCase",
+        "FixIdentifiersCase",
+        "ConvertObjectIdsToNames",
+        "AddMissingParentheses",
+        "AddDataClassifications",
+        "SortProcedures",
+        "SortProperties",
+        "SortTableFields",
+        "SortVariables",
+        "SortCustomizations",
+        "TrimTrailingWhitespace",
+        "MakeFlowFieldsReadOnly",
+        "FormatDocument",
+        "RemoveUnusedVariables",
+        "RemoveRedundantAppAreas",
+        "RemoveRedundantDataClassification",
+        "CollapseEmptyBrackets",
+        "OneStatementPerLine",
+        "RemoveProceduresSemicolon"
+    ],
+    "alOutline.completionProviders": [
+        "VariableNamesWithType"
+    ],
+    "al.enableCodeAnalysis": true,
+    "al.codeAnalyzers": [
+        "${PerTenantExtensionCop}",
+        "${analyzerFolder}BusinessCentral.LinterCop.dll"
+    ]
+}

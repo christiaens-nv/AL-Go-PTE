@@ -1,0 +1,109 @@
+{
+    "servers": {
+        /*"bc-code-intel": {
+            "type": "stdio",
+            "command": "npx",
+            "args": [
+                "bc-code-intelligence-mcp"
+            ]
+        },
+        "d365bc-admin": {
+            "type": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                "@demiliani/d365bc-admin-mcp"
+            ]
+        },*/
+        "microsoft.docs.mcp": {
+			"type": "http",
+			"url": "https://learn.microsoft.com/api/mcp"
+		},
+		"github/github-mcp-server": {
+			"type": "http",
+			"url": "https://api.githubcopilot.com/mcp/"
+		},
+		"objid": {
+			"type": "stdio",
+			"command": "npx",
+			"args": [
+				"-y",
+				"@sshadows/objid-mcp@2.2.0"
+			],
+			"env": {
+				"MCP_MODE": "${input:mcp_mode}",
+				"LOG_LEVEL": "${input:log_level}",
+                "BACKEND_URL": "${input:objid_backend_url}",
+                "BACKEND_API_KEY": "${input:objid_backend_api_key}"
+			}
+		},
+		"nab-al-tools": {
+			"command": "npx",
+			"args": [
+				"-y",
+				"@nabsolutions/nab-al-tools-mcp"
+			],
+			"type": "stdio"
+		},
+		"al-symbols-mcp": {
+			"type": "stdio",
+			"command": "npx",
+			"args": [
+				"al-mcp-server"
+			]
+		},
+		"Teamwork": {
+			"url": "https://mcp.ai.teamwork.com/",
+			"headers": {
+				"Authorization": "Bearer ${input:tw-mcp-token}"
+			},
+			"type": "http"
+		},
+
+		"microsoftdocs/mcp": {
+			"type": "http",
+			"url": "https://learn.microsoft.com/api/mcp",
+		},
+		"microsoft/azure-devops-mcp": {
+			"type": "stdio",
+			"command": "npx",
+			"args": [
+				"-y",
+				"@azure-devops/mcp",
+				"${input:ado_org}"
+			]
+		}
+	},
+	"inputs": [
+		{
+			"id": "mcp_mode",
+			"type": "promptString",
+			"description": "Which mode do you want to run the server in? (standard or lite)"
+		},
+		{
+			"id": "log_level",
+			"type": "promptString",
+			"description": "Log level (error, warn, info, debug)"
+		},
+        {
+            "id": "objid_backend_url",
+            "type": "promptString",
+            "description": "Objid backend URL"
+        },
+        {
+            "id": "objid_backend_api_key",
+            "type": "promptString",
+            "description": "Objid backend API key"
+        },
+		{
+			"id": "tw-mcp-token",
+			"type": "promptString",
+			"description": "Teamwork Bearer token"
+		},
+		{
+			"id": "ado_org",
+			"type": "promptString",
+			"description": "Azure DevOps organization name  (e.g. 'contoso')"
+		}
+	]
+}
