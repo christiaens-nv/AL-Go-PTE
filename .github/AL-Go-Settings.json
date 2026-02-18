@@ -3,6 +3,11 @@
   "type": "PTE",
   "templateUrl": "https://github.com/microsoft/AL-Go-PTE@main",
   "versioningStrategy": 2,
+  "enablePerTenantExtensionCop": true,
+  "environments": [
+    "BCBE-LIVE",
+    "BCBE-UAT"    
+  ],
   "DeployToBCBE-LIVE": {
     "EnvironmentType": "Cloud",
     "EnvironmentName": "BCBE-LIVE",
