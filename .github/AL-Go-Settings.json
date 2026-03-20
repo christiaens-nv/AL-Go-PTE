@@ -17,7 +17,7 @@
     "ContinuousDeployment": false,
     "runs-on": "DOCKER001",
     "Branches": [
-      "current_LIVE"
+      "xyz"
     ]
   },
     "DeployToBCBE-UAT": {
@@ -27,7 +27,7 @@
     "ContinuousDeployment": false,
     "runs-on": "DOCKER001",
     "Branches": [
-      "current_UAT"
+      "xyz"
     ]
   }
 }
