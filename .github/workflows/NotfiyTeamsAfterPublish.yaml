@@ -1,0 +1,293 @@
+name: Notify Teams After Publish
+
+on:
+  workflow_run:
+    workflows: ["Publish To Environment"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  notify:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Find matching GitHub Release (by commit SHA)
+        id: rel
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const sha  = context.payload.workflow_run.head_sha;
+
+            // Grab recent releases and find one that targets the same commit (best match).
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner, repo, per_page: 100
+            });
+
+            let release = releases.find(r => r.target_commitish === sha);
+
+            // Fallback: if no exact match, use latest release (still usually correct in AL-Go flows).
+            if (!release && releases.length) release = releases[0];
+
+            if (!release) {
+              core.setFailed("No GitHub Releases found. Is your release/changelog created as a GitHub Release?");
+              return;
+            }
+
+            core.setOutput("name", release.name || release.tag_name);
+            core.setOutput("url", release.html_url);
+            core.setOutput("body", release.body || "(No release notes found)");
+
+      - name: Get deployed environments
+        id: envs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const runId = context.payload.workflow_run.id;
+
+            // Fetch all jobs from the completed workflow run
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner,
+              repo,
+              run_id: runId
+            });
+
+            // Extract environment names from job names like "Deploy to PROD_UAT"
+            const environments = jobs
+              .filter(j => j.name.startsWith('Deploy to '))
+              .map(j => j.name.replace('Deploy to ', ''))
+              .filter((v, i, a) => a.indexOf(v) === i); // Remove duplicates
+
+            const envList = environments.length > 0 ? environments.join(", ") : "Unknown";
+            core.setOutput("environments", envList);
+
+      - name: Get app version from workflow output
+        id: version
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const runId = context.payload.workflow_run.id;
+
+            // Version pattern: four numeric segments separated by dots
+            const versionPattern = /(\d+\.\d+\.\d+\.\d+)/;
+            let appVersion = "Unknown";
+
+            try {
+              // Try to get the workflow run to access its conclusion/outputs
+              const workflowRun = await github.rest.actions.getWorkflowRun({
+                owner,
+                repo,
+                run_id: runId
+              });
+              
+              console.log(`Workflow run status: ${workflowRun.data.status}, conclusion: ${workflowRun.data.conclusion}`);
+              
+              // First, try to get version from workflow run artifacts
+              const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+                owner,
+                repo,
+                run_id: runId
+              });
+
+              // Look for version in artifact names
+              // Expected artifact name format might contain version
+              // Example: "Harmonize It_PVR_Proviron_Core_26.2026.2.0"
+              let foundInArtifacts = false;
+              for (const artifact of artifacts.data.artifacts) {
+                const match = artifact.name.match(versionPattern);
+                if (match && match[1]) {
+                  appVersion = match[1];
+                  console.log(`Found app version from artifact: ${appVersion}`);
+                  foundInArtifacts = true;
+                  break;
+                }
+              }
+
+              // Fallback: Get version from job logs if not found in artifacts
+              if (!foundInArtifacts) {
+                console.log('Version not found in artifacts, checking job logs...');
+                
+                const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                  owner,
+                  repo,
+                  run_id: runId
+                });
+
+                // Filter to only deployment jobs
+                // Dependency: Job names must start with "Deploy to " (with trailing space)
+                const deploymentJobs = jobs.filter(j => j.name.startsWith('Deploy to '));
+                
+                if (deploymentJobs.length > 0) {
+                  // Check the first deployment job logs
+                  // Assumption: All deployment jobs deploy the same app version
+                  const job = deploymentJobs[0];
+                  
+                  const logsResponse = await github.rest.actions.downloadJobLogsForWorkflowRun({
+                    owner,
+                    repo,
+                    job_id: job.id
+                  });
+
+                  // The API returns logs as text data
+                  const logContent = logsResponse.data;
+
+                  // Log format dependency: "Apps to deploy: <filename>" or "Apps to deploy - <filename>"
+                  // Expected filename format: <Publisher>_<AppName>_<Version>.app
+                  // Example: "Harmonize It_PVR_Proviron_Core_26.2026.2.0.app"
+                  const match = logContent.match(new RegExp(`Apps to deploy[:\\s-]+.*?_${versionPattern.source}\\.app`, 'i'));
+                  if (match && match[1]) {
+                    appVersion = match[1];
+                    console.log(`Found app version from logs: ${appVersion}`);
+                  } else {
+                    console.log('App version pattern not found in deployment job logs');
+                  }
+                } else {
+                  console.log('No deployment jobs found');
+                }
+              }
+            } catch (error) {
+              console.log(`Error fetching version: ${error.message}`);
+            }
+
+            core.setOutput("app_version", appVersion);
+
+      - name: Post changelog to Teams
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          RELEASE_NAME: ${{ steps.rel.outputs.name }}
+          RELEASE_URL: ${{ steps.rel.outputs.url }}
+          RELEASE_BODY: ${{ steps.rel.outputs.body }}
+          ENVIRONMENTS: ${{ steps.envs.outputs.environments }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}
+        run: |
+          # Teams has payload size limits; keep it safe.
+          export BODY_TRIMMED="$(printf "%s" "$RELEASE_BODY" | head -c 25000)"
+
+          # Create Adaptive Card payload using python and save to file for debugging
+          python3 - << 'PY' > /tmp/teams-payload.json
+          import json, os
+          
+          payload = {
+            "type": "message",
+            "attachments": [
+              {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  "type": "AdaptiveCard",
+                  "version": "1.4",
+                  "body": [
+                    {
+                      "type": "TextBlock",
+                      "text": "✅ Publish To Environment Completed",
+                      "weight": "Bolder",
+                      "size": "Large",
+                      "color": "Good"
+                    },
+                    {
+                      "type": "FactSet",
+                      "facts": [
+                        {
+                          "title": "Release:",
+                          "value": os.environ['RELEASE_NAME']
+                        },
+                        {
+                          "title": "App Version:",
+                          "value": os.environ['APP_VERSION']
+                        },
+                        {
+                          "title": "Environments:",
+                          "value": os.environ['ENVIRONMENTS']
+                        },
+                        {
+                          "title": "Workflow run:",
+                          "value": f"[View workflow]({os.environ['RUN_URL']})"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "TextBlock",
+                      "text": "Changelog",
+                      "weight": "Bolder",
+                      "size": "Medium",
+                      "separator": True
+                    },
+                    {
+                      "type": "TextBlock",
+                      "text": os.environ['BODY_TRIMMED'],
+                      "wrap": True,
+                      "isSubtle": True
+                    }
+                  ],
+                  "actions": [
+                    {
+                      "type": "Action.OpenUrl",
+                      "title": "View Release on GitHub",
+                      "url": os.environ['RELEASE_URL']
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+          print(json.dumps(payload))
+          PY
+
+          echo "::group::Teams Webhook Details"
+          echo "Endpoint: [REDACTED - stored in TEAMS_WEBHOOK_URL secret]"
+          echo "Method: POST"
+          echo "Content-Type: application/json"
+          echo "::endgroup::"
+
+          echo "::group::JSON Payload"
+          cat /tmp/teams-payload.json
+          echo ""
+          echo "::endgroup::"
+
+          echo "::group::Sending to Teams..."
+          # Send to Teams and capture response
+          CURL_EXIT=0
+          HTTP_CODE=$(curl -w "%{http_code}" -o /tmp/teams-response.txt \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d @/tmp/teams-payload.json \
+            "$TEAMS_WEBHOOK_URL" 2>/tmp/teams-error.txt) || CURL_EXIT=$?
+          
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "::error::❌ curl command failed with exit code ${CURL_EXIT}"
+            if [ -s /tmp/teams-error.txt ]; then
+              echo "Error details:"
+              cat /tmp/teams-error.txt
+            fi
+            exit 1
+          fi
+          
+          # Validate HTTP_CODE is non-empty and numeric
+          if [ -z "$HTTP_CODE" ] || ! [[ "$HTTP_CODE" =~ ^[0-9]+$ ]]; then
+            echo "::error::❌ Invalid HTTP status code: '${HTTP_CODE:-empty}'"
+            exit 1
+          fi
+          
+          echo "HTTP Status Code: $HTTP_CODE"
+          echo "Response Body:"
+          cat /tmp/teams-response.txt
+          echo ""
+          echo "::endgroup::"
+
+          # Check if the request was successful
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "✅ Successfully posted to Teams (HTTP $HTTP_CODE)"
+          else
+            echo "::error::❌ Failed to post to Teams (HTTP $HTTP_CODE)"
+            exit 1
+          fi
