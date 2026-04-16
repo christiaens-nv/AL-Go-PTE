@@ -1,0 +1,337 @@
+name: Notify Teams After Publish
+
+on:
+  workflow_run:
+    workflows: ["Publish To Environment"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  notify:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Find deployment tags created by workflow
+        id: deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const runId = context.payload.workflow_run.id;
+
+            // Get all tags from the repository
+            const allRefs = await github.paginate(github.rest.git.listMatchingRefs, {
+              owner,
+              repo,
+              ref: 'tags/deployed/'
+            });
+
+            // Get the workflow run to find the commit SHA
+            const workflowRun = await github.rest.actions.getWorkflowRun({
+              owner,
+              repo,
+              run_id: runId
+            });
+
+            const commitSha = workflowRun.data.head_sha;
+
+            // Find tags that point to this commit
+            const deploymentTags = [];
+            for (const ref of allRefs) {
+              const tagName = ref.ref.replace('refs/tags/', '');
+              
+              // Get the tag object to find what it points to
+              try {
+                const tag = await github.rest.git.getRef({
+                  owner,
+                  repo,
+                  ref: `tags/${tagName}`
+                });
+                
+                // Check if this tag was created in this workflow run by checking the commit
+                // Tag format: deployed/{environment}/{version}
+                const match = tagName.match(/^deployed\/([^\/]+)\/(.+)$/);
+                if (match) {
+                  const [, envName, version] = match;
+                  deploymentTags.push({ 
+                    tag: tagName, 
+                    environment: envName, 
+                    version: version,
+                    sha: tag.data.object.sha
+                  });
+                }
+              } catch (error) {
+                console.log(`Error checking tag ${tagName}: ${error.message}`);
+              }
+            }
+
+            // Filter to tags that match our commit (likely created in this run)
+            const currentDeployments = deploymentTags.filter(dt => dt.sha === commitSha);
+
+            if (currentDeployments.length === 0) {
+              core.setFailed("No deployment tags found for this workflow run. The deployment may not have completed successfully.");
+              return;
+            }
+
+            // Store deployment information for later steps
+            core.setOutput("deployments", JSON.stringify(currentDeployments));
+            core.setOutput("version", currentDeployments[0].version);
+            core.setOutput("commit_sha", commitSha);
+
+      - name: Get deployed environments
+        id: envs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployments = JSON.parse('${{ steps.deployment.outputs.deployments }}');
+            const environments = deployments.map(d => d.environment).join(", ");
+            core.setOutput("environments", environments);
+
+      - name: Build changelog for each environment
+        id: changelog
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const deployments = JSON.parse('${{ steps.deployment.outputs.deployments }}');
+            
+            const changelogs = [];
+            
+            for (const deployment of deployments) {
+              const currentTag = deployment.tag;
+              const envName = deployment.environment;
+              const version = deployment.version;
+              
+              console.log(`Building changelog for ${envName} - version ${version}`);
+              
+              // Find the previous deployment tag for this environment
+              let previousTag = null;
+              let commits = [];
+              let compareUrl = "";
+              
+              try {
+                // Get all tags for this environment
+                const envTags = await github.paginate(github.rest.git.listMatchingRefs, {
+                  owner,
+                  repo,
+                  ref: `tags/deployed/${envName}/`
+                });
+                
+                // Sort by tag name (versions) and find the one before current
+                const sortedTags = envTags
+                  .map(t => t.ref.replace('refs/tags/', ''))
+                  .filter(t => t !== currentTag)
+                  .sort()
+                  .reverse();
+                
+                if (sortedTags.length > 0) {
+                  previousTag = sortedTags[0];
+                  
+                  // Get the comparison between tags
+                  const comparison = await github.rest.repos.compareCommits({
+                    owner,
+                    repo,
+                    base: previousTag,
+                    head: currentTag
+                  });
+                  
+                  commits = comparison.data.commits.map(c => ({
+                    sha: c.sha.substring(0, 7),
+                    message: c.commit.message.split('\n')[0]
+                  }));
+                  
+                  compareUrl = `https://github.com/${owner}/${repo}/compare/${previousTag}...${currentTag}`;
+                } else {
+                  // First deployment
+                  previousTag = "First deployment";
+                  compareUrl = `https://github.com/${owner}/${repo}/commits/${currentTag}`;
+                  commits = [{ sha: "", message: "Initial deployment - no previous version to compare" }];
+                }
+                
+              } catch (error) {
+                console.log(`Error building changelog for ${envName}: ${error.message}`);
+                commits = [{ sha: "", message: "Error retrieving commit history" }];
+              }
+              
+              changelogs.push({
+                environment: envName,
+                version: version,
+                previousVersion: previousTag.replace(`deployed/${envName}/`, ''),
+                commits: commits,
+                compareUrl: compareUrl
+              });
+            }
+            
+            core.setOutput("changelogs", JSON.stringify(changelogs));
+
+      - name: Post changelog to Teams
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          CHANGELOGS: ${{ steps.changelog.outputs.changelogs }}
+          ENVIRONMENTS: ${{ steps.envs.outputs.environments }}
+          APP_VERSION: ${{ steps.deployment.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}
+        run: |
+          # Create Adaptive Card payload using python
+          python3 - << 'PY' > /tmp/teams-payload.json
+          import json, os
+          
+          changelogs = json.loads(os.environ['CHANGELOGS'])
+          
+          # Build body sections for each environment
+          body_sections = [
+            {
+              "type": "TextBlock",
+              "text": "✅ Deployment Completed",
+              "weight": "Bolder",
+              "size": "Large",
+              "color": "Good"
+            },
+            {
+              "type": "FactSet",
+              "facts": [
+                {
+                  "title": "App Version:",
+                  "value": os.environ['APP_VERSION']
+                },
+                {
+                  "title": "Environments:",
+                  "value": os.environ['ENVIRONMENTS']
+                },
+                {
+                  "title": "Workflow run:",
+                  "value": f"[View workflow]({os.environ['RUN_URL']})"
+                }
+              ]
+            }
+          ]
+          
+          # Add details for each environment
+          for changelog in changelogs:
+            env_name = changelog['environment']
+            version = changelog['version']
+            prev_version = changelog['previousVersion']
+            commits = changelog['commits']
+            compare_url = changelog['compareUrl']
+            
+            # Add separator and environment header
+            body_sections.append({
+              "type": "TextBlock",
+              "text": f"Environment: {env_name}",
+              "weight": "Bolder",
+              "size": "Medium",
+              "separator": True
+            })
+            
+            # Add version info
+            body_sections.append({
+              "type": "FactSet",
+              "facts": [
+                {
+                  "title": "Current Version:",
+                  "value": version
+                },
+                {
+                  "title": "Previous Version:",
+                  "value": prev_version
+                }
+              ]
+            })
+            
+            # Add commits
+            commit_lines = []
+            for commit in commits[:10]:  # Limit to 10 commits to avoid payload size issues
+              if commit['sha']:
+                commit_lines.append(f"• `{commit['sha']}` {commit['message']}")
+              else:
+                commit_lines.append(f"• {commit['message']}")
+            
+            if len(commits) > 10:
+              commit_lines.append(f"... and {len(commits) - 10} more commits")
+            
+            body_sections.append({
+              "type": "TextBlock",
+              "text": "\\n".join(commit_lines) if commit_lines else "No commits found",
+              "wrap": True,
+              "isSubtle": True,
+              "spacing": "Small"
+            })
+          
+          payload = {
+            "type": "message",
+            "attachments": [
+              {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  "type": "AdaptiveCard",
+                  "version": "1.4",
+                  "body": body_sections,
+                  "actions": [
+                    {
+                      "type": "Action.OpenUrl",
+                      "title": "View Workflow Run",
+                      "url": os.environ['RUN_URL']
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+          print(json.dumps(payload))
+          PY
+
+          echo "::group::Teams Webhook Details"
+          echo "Endpoint: [REDACTED - stored in TEAMS_WEBHOOK_URL secret]"
+          echo "Method: POST"
+          echo "Content-Type: application/json"
+          echo "::endgroup::"
+
+          echo "::group::JSON Payload"
+          cat /tmp/teams-payload.json
+          echo ""
+          echo "::endgroup::"
+
+          echo "::group::Sending to Teams..."
+          # Send to Teams and capture response
+          CURL_EXIT=0
+          HTTP_CODE=$(curl -w "%{http_code}" -o /tmp/teams-response.txt \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d @/tmp/teams-payload.json \
+            "$TEAMS_WEBHOOK_URL" 2>/tmp/teams-error.txt) || CURL_EXIT=$?
+          
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "::error::❌ curl command failed with exit code ${CURL_EXIT}"
+            if [ -s /tmp/teams-error.txt ]; then
+              echo "Error details:"
+              cat /tmp/teams-error.txt
+            fi
+            exit 1
+          fi
+          
+          # Validate HTTP_CODE is non-empty and numeric
+          if [ -z "$HTTP_CODE" ] || ! [[ "$HTTP_CODE" =~ ^[0-9]+$ ]]; then
+            echo "::error::❌ Invalid HTTP status code: '${HTTP_CODE:-empty}'"
+            exit 1
+          fi
+          
+          echo "HTTP Status Code: $HTTP_CODE"
+          echo "Response Body:"
+          cat /tmp/teams-response.txt
+          echo ""
+          echo "::endgroup::"
+
+          # Check if the request was successful
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "✅ Successfully posted to Teams (HTTP $HTTP_CODE)"
+          else
+            echo "::error::❌ Failed to post to Teams (HTTP $HTTP_CODE)"
+            exit 1
+          fi
