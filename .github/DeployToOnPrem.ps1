@@ -30,7 +30,7 @@ function Get-NavAdminToolPath {
         [Parameter(Mandatory = $true)]
         [string] $ServerInstance
     )
-    $path = ([string](Get-WmiObject win32_service | ?{$_.Name.ToString().ToUpper() -like "*NavServer*$ServerInstance*"} | select PathName).PathName).ToUpper()
+    $path = ([string](Get-WmiObject win32_service | Where-Object {$_.Name.ToString().ToUpper() -like "*NavServer*$ServerInstance*"} | Select-Object PathName).PathName).ToUpper()
 
     $shortPath = $path.Substring(0,$path.IndexOf("EXE") + 3)
     if ($shortPath.StartsWith('"'))
@@ -96,14 +96,25 @@ function Deploy-NavAppFile {
     $appPublisher = $appInfo.Publisher
     $appVersion = $appInfo.Version
 
+    $previousInstalledVersions = @(
+        Get-NAVAppInfo -ServerInstance $ServerInstance -Tenant $Tenant -Name $appName -Publisher $appPublisher -ErrorAction SilentlyContinue
+    )
+    $hasPreviousInstalledVersion = ($previousInstalledVersions.Count -gt 0)
+
     Write-Host "Publishing $appName ($appVersion)"
     Publish-NAVApp -ServerInstance $ServerInstance -Path $AppPath -SkipVerification
 
     Write-Host "Syncing $appName ($appVersion)"
     Sync-NAVApp -ServerInstance $ServerInstance -Tenant $Tenant -Name $appName -Publisher $appPublisher -Version $appVersion
 
-    Write-Host "Starting data upgrade for $appName ($appVersion)"
-    Start-NAVAppDataUpgrade -ServerInstance $ServerInstance -Tenant $Tenant -Name $appName -Publisher $appPublisher -Version $appVersion
+    if ($hasPreviousInstalledVersion) {
+        Write-Host "Starting data upgrade for $appName ($appVersion)"
+        Start-NAVAppDataUpgrade -ServerInstance $ServerInstance -Tenant $Tenant -Name $appName -Publisher $appPublisher -Version $appVersion
+    }
+    else {
+        Write-Host "Installing $appName ($appVersion)"
+        Install-NAVApp -ServerInstance $ServerInstance -Tenant $Tenant -Name $appName -Publisher $appPublisher -Version $appVersion
+    }
 }
 
 $serverInstance = Get-ParameterValue -InputObject $parameters -Names @('ServerInstance', 'BCServerInstance', 'InstanceName', 'EnvironmentName')
