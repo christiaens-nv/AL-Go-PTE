@@ -4,6 +4,7 @@
   "templateUrl": "https://github.com/microsoft/AL-Go-PTE@main",
   "repoVersion": "27.0",
   "versioningStrategy": 18,
+  "cacheKeepDays": 9999,
   "enablePerTenantExtensionCop": true,
   "cacheImageName": "",
   "environments": [
