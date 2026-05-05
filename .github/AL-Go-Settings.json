@@ -6,7 +6,6 @@
   "versioningStrategy": 18,
   "cacheKeepDays": 9999,
   "enablePerTenantExtensionCop": true,
-  "cacheImageName": "",
   "environments": [
     "BCBE-LIVE",
     "BCBE-UAT"    
