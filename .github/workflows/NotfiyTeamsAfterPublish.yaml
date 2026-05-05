@@ -15,167 +15,281 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Find matching GitHub Release (by commit SHA)
-        id: rel
+      - name: Find deployment tags created by workflow
+        id: deployment
         uses: actions/github-script@v7
         with:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const sha  = context.payload.workflow_run.head_sha;
+            const runId = context.payload.workflow_run.id;
 
-            // Grab recent releases and find one that targets the same commit (best match).
-            const releases = await github.paginate(github.rest.repos.listReleases, {
-              owner, repo, per_page: 100
+            // Get all tags from the repository
+            const allRefs = await github.paginate(github.rest.git.listMatchingRefs, {
+              owner,
+              repo,
+              ref: 'tags/deployed/'
             });
 
-            let release = releases.find(r => r.target_commitish === sha);
+            // Get the workflow run to find the commit SHA
+            const workflowRun = await github.rest.actions.getWorkflowRun({
+              owner,
+              repo,
+              run_id: runId
+            });
 
-            // Fallback: if no exact match, use latest release (still usually correct in AL-Go flows).
-            if (!release && releases.length) release = releases[0];
+            const commitSha = workflowRun.data.head_sha;
 
-            if (!release) {
-              core.setFailed("No GitHub Releases found. Is your release/changelog created as a GitHub Release?");
+            // Find tags that point to this commit
+            const deploymentTags = [];
+            for (const ref of allRefs) {
+              const tagName = ref.ref.replace('refs/tags/', '');
+              
+              // Get the tag object to find what it points to
+              try {
+                const tag = await github.rest.git.getRef({
+                  owner,
+                  repo,
+                  ref: `tags/${tagName}`
+                });
+                
+                // Check if this tag was created in this workflow run by checking the commit
+                // Tag format: deployed/{environment}/{version}
+                const match = tagName.match(/^deployed\/([^\/]+)\/(.+)$/);
+                if (match) {
+                  const [, envName, version] = match;
+                  deploymentTags.push({ 
+                    tag: tagName, 
+                    environment: envName, 
+                    version: version,
+                    sha: tag.data.object.sha
+                  });
+                }
+              } catch (error) {
+                console.log(`Error checking tag ${tagName}: ${error.message}`);
+              }
+            }
+
+            // Filter to tags that match our commit (likely created in this run)
+            const currentDeployments = deploymentTags.filter(dt => dt.sha === commitSha);
+
+            if (currentDeployments.length === 0) {
+              core.setFailed("No deployment tags found for this workflow run. The deployment may not have completed successfully.");
               return;
             }
 
-            core.setOutput("name", release.name || release.tag_name);
-            core.setOutput("url", release.html_url);
-            core.setOutput("body", release.body || "(No release notes found)");
+            // Store deployment information for later steps
+            core.setOutput("deployments", JSON.stringify(currentDeployments));
+            core.setOutput("version", currentDeployments[0].version);
+            core.setOutput("commit_sha", commitSha);
 
       - name: Get deployed environments
         id: envs
         uses: actions/github-script@v7
         with:
           script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const runId = context.payload.workflow_run.id;
+            const deployments = JSON.parse('${{ steps.deployment.outputs.deployments }}');
+            const environments = deployments.map(d => d.environment).join(", ");
+            core.setOutput("environments", environments);
 
-            // Fetch all jobs from the completed workflow run
-            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
-              owner,
-              repo,
-              run_id: runId
-            });
-
-            // Extract environment names from job names like "Deploy to PROD_UAT"
-            const environments = jobs
-              .filter(j => j.name.startsWith('Deploy to '))
-              .map(j => j.name.replace('Deploy to ', ''))
-              .filter((v, i, a) => a.indexOf(v) === i); // Remove duplicates
-
-            const envList = environments.length > 0 ? environments.join(", ") : "Unknown";
-            core.setOutput("environments", envList);
-
-      - name: Get app version from workflow output
-        id: version
+      - name: Build changelog for each environment
+        id: changelog
         uses: actions/github-script@v7
         with:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const runId = context.payload.workflow_run.id;
-
-            // Version pattern: four numeric segments separated by dots
-            const versionPattern = /(\d+\.\d+\.\d+\.\d+)/;
-            let appVersion = "Unknown";
-
-            try {
-              // Try to get the workflow run to access its conclusion/outputs
-              const workflowRun = await github.rest.actions.getWorkflowRun({
-                owner,
-                repo,
-                run_id: runId
-              });
+            const deployments = JSON.parse('${{ steps.deployment.outputs.deployments }}');
+            
+            const changelogs = [];
+            
+            for (const deployment of deployments) {
+              const currentTag = deployment.tag;
+              const envName = deployment.environment;
+              const version = deployment.version;
               
-              console.log(`Workflow run status: ${workflowRun.data.status}, conclusion: ${workflowRun.data.conclusion}`);
+              console.log(`Building changelog for ${envName} - version ${version}`);
               
-              // First, try to get version from workflow run artifacts
-              const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
-                owner,
-                repo,
-                run_id: runId
-              });
-
-              // Look for version in artifact names
-              // Expected artifact name format might contain version
-              // Example: "Harmonize It_PVR_Proviron_Core_26.2026.2.0"
-              let foundInArtifacts = false;
-              for (const artifact of artifacts.data.artifacts) {
-                const match = artifact.name.match(versionPattern);
-                if (match && match[1]) {
-                  appVersion = match[1];
-                  console.log(`Found app version from artifact: ${appVersion}`);
-                  foundInArtifacts = true;
-                  break;
-                }
-              }
-
-              // Fallback: Get version from job logs if not found in artifacts
-              if (!foundInArtifacts) {
-                console.log('Version not found in artifacts, checking job logs...');
-                
-                const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              // Find the previous deployment tag for this environment
+              let previousTag = null;
+              let commits = [];
+              let compareUrl = "";
+              
+              try {
+                // Get all tags for this environment
+                const envTags = await github.paginate(github.rest.git.listMatchingRefs, {
                   owner,
                   repo,
-                  run_id: runId
+                  ref: `tags/deployed/${envName}/`
                 });
-
-                // Filter to only deployment jobs
-                // Dependency: Job names must start with "Deploy to " (with trailing space)
-                const deploymentJobs = jobs.filter(j => j.name.startsWith('Deploy to '));
                 
-                if (deploymentJobs.length > 0) {
-                  // Check the first deployment job logs
-                  // Assumption: All deployment jobs deploy the same app version
-                  const job = deploymentJobs[0];
+                // Sort by tag name (versions) and find the one before current
+                const sortedTags = envTags
+                  .map(t => t.ref.replace('refs/tags/', ''))
+                  .filter(t => t !== currentTag)
+                  .sort()
+                  .reverse();
+                
+                if (sortedTags.length > 0) {
+                  previousTag = sortedTags[0];
                   
-                  const logsResponse = await github.rest.actions.downloadJobLogsForWorkflowRun({
+                  // Get the comparison between tags
+                  const comparison = await github.rest.repos.compareCommits({
                     owner,
                     repo,
-                    job_id: job.id
+                    base: previousTag,
+                    head: currentTag
                   });
-
-                  // The API returns logs as text data
-                  const logContent = logsResponse.data;
-
-                  // Log format dependency: "Apps to deploy: <filename>" or "Apps to deploy - <filename>"
-                  // Expected filename format: <Publisher>_<AppName>_<Version>.app
-                  // Example: "Harmonize It_PVR_Proviron_Core_26.2026.2.0.app"
-                  const match = logContent.match(new RegExp(`Apps to deploy[:\\s-]+.*?_${versionPattern.source}\\.app`, 'i'));
-                  if (match && match[1]) {
-                    appVersion = match[1];
-                    console.log(`Found app version from logs: ${appVersion}`);
-                  } else {
-                    console.log('App version pattern not found in deployment job logs');
-                  }
+                  
+                  commits = comparison.data.commits.map(c => ({
+                    sha: c.sha.substring(0, 7),
+                    url: `https://github.com/${owner}/${repo}/commit/${c.sha}`,
+                    message: c.commit.message.split(/\r?\n/)[0].trim()
+                  }));
+                  
+                  compareUrl = `https://github.com/${owner}/${repo}/compare/${previousTag}...${currentTag}`;
                 } else {
-                  console.log('No deployment jobs found');
+                  // First deployment
+                  previousTag = "First deployment";
+                  compareUrl = `https://github.com/${owner}/${repo}/commits/${currentTag}`;
+                  commits = [{ sha: "", url: "", message: "Initial deployment - no previous version to compare" }];
                 }
+                
+              } catch (error) {
+                console.log(`Error building changelog for ${envName}: ${error.message}`);
+                commits = [{ sha: "", message: "Error retrieving commit history" }];
               }
-            } catch (error) {
-              console.log(`Error fetching version: ${error.message}`);
+              
+              changelogs.push({
+                environment: envName,
+                version: version,
+                previousVersion: previousTag.replace(`deployed/${envName}/`, ''),
+                commits: commits,
+                compareUrl: compareUrl
+              });
             }
-
-            core.setOutput("app_version", appVersion);
+            
+            core.setOutput("changelogs", JSON.stringify(changelogs));
 
       - name: Post changelog to Teams
         env:
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
-          RELEASE_NAME: ${{ steps.rel.outputs.name }}
-          RELEASE_URL: ${{ steps.rel.outputs.url }}
-          RELEASE_BODY: ${{ steps.rel.outputs.body }}
+          CHANGELOGS: ${{ steps.changelog.outputs.changelogs }}
           ENVIRONMENTS: ${{ steps.envs.outputs.environments }}
-          APP_VERSION: ${{ steps.version.outputs.app_version }}
+          APP_VERSION: ${{ steps.deployment.outputs.version }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}
         run: |
-          # Teams has payload size limits; keep it safe.
-          export BODY_TRIMMED="$(printf "%s" "$RELEASE_BODY" | head -c 25000)"
-
-          # Create Adaptive Card payload using python and save to file for debugging
+          # Create Adaptive Card payload using python
           python3 - << 'PY' > /tmp/teams-payload.json
           import json, os
+          
+          changelogs = json.loads(os.environ['CHANGELOGS'])
+          
+          # Build body sections for each environment
+          body_sections = [
+            {
+              "type": "TextBlock",
+              "text": "✅ Deployment Completed",
+              "weight": "Bolder",
+              "size": "Large",
+              "color": "Good"
+            },
+            {
+              "type": "FactSet",
+              "facts": [
+                {
+                  "title": "App Version:",
+                  "value": os.environ['APP_VERSION']
+                },
+                {
+                  "title": "Environments:",
+                  "value": os.environ['ENVIRONMENTS']
+                },
+                {
+                  "title": "Workflow run:",
+                  "value": f"[View workflow]({os.environ['RUN_URL']})"
+                }
+              ]
+            }
+          ]
+          
+          # Add details for each environment
+          for changelog in changelogs:
+            env_name = changelog['environment']
+            version = changelog['version']
+            prev_version = changelog['previousVersion']
+            commits = changelog['commits']
+            compare_url = changelog['compareUrl']
+            
+            # Add separator and environment header
+            body_sections.append({
+              "type": "TextBlock",
+              "text": f"Environment: {env_name}",
+              "weight": "Bolder",
+              "size": "Medium",
+              "separator": True
+            })
+            
+            # Add version info
+            body_sections.append({
+              "type": "FactSet",
+              "facts": [
+                {
+                  "title": "Current Version:",
+                  "value": version
+                },
+                {
+                  "title": "Previous Version:",
+                  "value": prev_version
+                }
+              ]
+            })
+            
+            # Add commits header
+            body_sections.append({
+              "type": "TextBlock",
+              "text": "Commits:",
+              "weight": "Bolder",
+              "spacing": "Medium",
+              "size": "Small"
+            })
+
+            # Add commits — one RichTextBlock per commit for proper inline link rendering
+            shown_commits = commits[:10]  # Limit to 10 to avoid payload size issues
+            for commit in shown_commits:
+              clean_msg = commit.get('message', '').replace('\n', ' ').replace('\r', '').strip()
+              if commit.get('sha') and commit.get('url'):
+                inlines = [
+                  {"type": "TextRun", "text": commit['sha'],
+                   "selectAction": {"type": "Action.OpenUrl", "url": commit['url']},
+                   "color": "Accent", "isSubtle": False},
+                  {"type": "TextRun", "text": f"  {clean_msg}", "isSubtle": True}
+                ]
+              else:
+                inlines = [{"type": "TextRun", "text": clean_msg, "isSubtle": True}]
+              body_sections.append({
+                "type": "RichTextBlock",
+                "inlines": inlines,
+                "spacing": "Small"
+              })
+
+            if len(commits) > 10:
+              body_sections.append({
+                "type": "TextBlock",
+                "text": f"... and {len(commits) - 10} more commits",
+                "wrap": True,
+                "isSubtle": True,
+                "spacing": "Small"
+              })
+
+            if not shown_commits:
+              body_sections.append({
+                "type": "TextBlock",
+                "text": "No commits found",
+                "wrap": True,
+                "isSubtle": True,
+                "spacing": "Small"
+              })
           
           payload = {
             "type": "message",
@@ -186,54 +300,12 @@ jobs:
                   "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
                   "type": "AdaptiveCard",
                   "version": "1.4",
-                  "body": [
-                    {
-                      "type": "TextBlock",
-                      "text": "✅ Publish To Environment Completed",
-                      "weight": "Bolder",
-                      "size": "Large",
-                      "color": "Good"
-                    },
-                    {
-                      "type": "FactSet",
-                      "facts": [
-                        {
-                          "title": "Release:",
-                          "value": os.environ['RELEASE_NAME']
-                        },
-                        {
-                          "title": "App Version:",
-                          "value": os.environ['APP_VERSION']
-                        },
-                        {
-                          "title": "Environments:",
-                          "value": os.environ['ENVIRONMENTS']
-                        },
-                        {
-                          "title": "Workflow run:",
-                          "value": f"[View workflow]({os.environ['RUN_URL']})"
-                        }
-                      ]
-                    },
-                    {
-                      "type": "TextBlock",
-                      "text": "Changelog",
-                      "weight": "Bolder",
-                      "size": "Medium",
-                      "separator": True
-                    },
-                    {
-                      "type": "TextBlock",
-                      "text": os.environ['BODY_TRIMMED'],
-                      "wrap": True,
-                      "isSubtle": True
-                    }
-                  ],
+                  "body": body_sections,
                   "actions": [
                     {
                       "type": "Action.OpenUrl",
-                      "title": "View Release on GitHub",
-                      "url": os.environ['RELEASE_URL']
+                      "title": "View Workflow Run",
+                      "url": os.environ['RUN_URL']
                     }
                   ]
                 }
@@ -244,7 +316,7 @@ jobs:
           PY
 
           echo "::group::Teams Webhook Details"
-          echo "Endpoint: [REDACTED - stored in TEAMS_WEBHOOK_URL secret]"
+          echo "Endpoint: $TEAMS_WEBHOOK_URL"
           echo "Method: POST"
           echo "Content-Type: application/json"
           echo "::endgroup::"
