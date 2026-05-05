@@ -195,8 +195,104 @@ jobs:
           artifactsFolder: '.artifacts'
           deploymentEnvironmentsJson: ${{ needs.Initialization.outputs.deploymentEnvironmentsJson }}
 
-  PostProcess:
+
+  CustomJobTagDeployment:
+    name: Tag deployment and post changelog
     needs: [ Initialization, Deploy ]
+    if: (!cancelled()) && (needs.Deploy.result == 'success')
+    runs-on: [ windows-latest ]
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Get Artifacts for deployment
+        uses: microsoft/AL-Go-Actions/GetArtifactsForDeployment@v9.0
+        with:
+          shell: powershell
+          artifactsVersion: ${{ github.event.inputs.appVersion }}
+          artifactsFolder: '.artifacts'
+          buildMode: Default
+
+      - name: Tag deployments and post changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $errorActionPreference = "Stop"
+
+          $version = Get-ChildItem '.artifacts' -Directory |
+              ForEach-Object { if ($_.Name -match '-Apps-(\d+\.\d+\.\d+\.\d+)') { $Matches[1] } } |
+              Select-Object -First 1
+
+          if (-not $version) {
+              Write-Host "::warning::No versioned artifact found in .artifacts — skipping deployment tags."
+              exit 0
+          }
+
+          $environments = ('${{ needs.Initialization.outputs.environmentsMatrixJson }}' | ConvertFrom-Json).matrix.include |
+              ForEach-Object { $_.environment.Split(' ')[0] }
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          foreach ($envName in $environments) {
+              $newTag = "deployed/$envName/$version"
+
+              gh api "repos/$env:GITHUB_REPOSITORY/git/refs/tags/$newTag" 2>$null | Out-Null
+              if ($LASTEXITCODE -eq 0) {
+                  Write-Host "Tag $newTag already exists — skipping."
+                  continue
+              }
+
+              $previousTag = $null
+              $allTags = gh api "repos/$env:GITHUB_REPOSITORY/git/refs/tags/deployed/$envName/" 2>$null | ConvertFrom-Json
+              if ($allTags) {
+                  $previousTag = @($allTags) |
+                      Sort-Object { $_.ref } -Descending |
+                      Select-Object -First 1 |
+                      ForEach-Object { $_.ref -replace 'refs/tags/', '' }
+              }
+
+              git tag $newTag
+              git push origin $newTag
+              Write-Host "Created tag: $newTag"
+
+              if ($previousTag) {
+                  $compareUrl  = "https://github.com/$env:GITHUB_REPOSITORY/compare/$previousTag...$newTag"
+                  $comparison  = gh api "repos/$env:GITHUB_REPOSITORY/compare/$previousTag...$newTag" | ConvertFrom-Json
+                  $commitLines = $comparison.commits | ForEach-Object {
+                      "- ``$($_.sha.Substring(0,7))`` $($_.commit.message.Split("`n")[0])"
+                  }
+                  if (-not $commitLines) { $commitLines = @("_(no code changes between these versions)_") }
+              }
+              else {
+                  $compareUrl  = "https://github.com/$env:GITHUB_REPOSITORY/commits/$newTag"
+                  $commitLines = @("_(no previous deployment tag found — this is the first tracked deployment)_")
+                  $previousTag = "—"
+              }
+
+              $summary = @"
+          ## Deployment to ``$envName`` — version ``$version``
+
+          | | |
+          |---|---|
+          | **Environment** | ``$envName`` |
+          | **Version deployed** | ``$version`` |
+          | **Previous version** | ``$previousTag`` |
+          | **Full diff** | [Compare on GitHub]($compareUrl) |
+
+          ### Commits included in this deployment
+          $($commitLines -join "`n")
+          "@
+              $summary | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+              Write-Host $summary
+          }
+
+  PostProcess:
+    needs: [ Initialization, Deploy, CustomJobTagDeployment ]
     if: always()
     runs-on: [ windows-latest ]
     steps:
