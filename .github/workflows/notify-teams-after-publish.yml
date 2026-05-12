@@ -143,7 +143,8 @@ jobs:
                   
                   commits = comparison.data.commits.map(c => ({
                     sha: c.sha.substring(0, 7),
-                    message: c.commit.message.split('\n')[0]
+                    url: `https://github.com/${owner}/${repo}/commit/${c.sha}`,
+                    message: c.commit.message.split(/\r?\n/)[0].trim()
                   }));
                   
                   compareUrl = `https://github.com/${owner}/${repo}/compare/${previousTag}...${currentTag}`;
@@ -151,7 +152,7 @@ jobs:
                   // First deployment
                   previousTag = "First deployment";
                   compareUrl = `https://github.com/${owner}/${repo}/commits/${currentTag}`;
-                  commits = [{ sha: "", message: "Initial deployment - no previous version to compare" }];
+                  commits = [{ sha: "", url: "", message: "Initial deployment - no previous version to compare" }];
                 }
                 
               } catch (error) {
@@ -244,24 +245,51 @@ jobs:
               ]
             })
             
-            # Add commits
-            commit_lines = []
-            for commit in commits[:10]:  # Limit to 10 commits to avoid payload size issues
-              if commit['sha']:
-                commit_lines.append(f"• `{commit['sha']}` {commit['message']}")
-              else:
-                commit_lines.append(f"• {commit['message']}")
-            
-            if len(commits) > 10:
-              commit_lines.append(f"... and {len(commits) - 10} more commits")
-            
+            # Add commits header
             body_sections.append({
               "type": "TextBlock",
-              "text": "\\n".join(commit_lines) if commit_lines else "No commits found",
-              "wrap": True,
-              "isSubtle": True,
-              "spacing": "Small"
+              "text": "Commits:",
+              "weight": "Bolder",
+              "spacing": "Medium",
+              "size": "Small"
             })
+
+            # Add commits — one RichTextBlock per commit for proper inline link rendering
+            shown_commits = commits[:10]  # Limit to 10 to avoid payload size issues
+            for commit in shown_commits:
+              clean_msg = commit.get('message', '').replace('\n', ' ').replace('\r', '').strip()
+              if commit.get('sha') and commit.get('url'):
+                inlines = [
+                  {"type": "TextRun", "text": commit['sha'],
+                   "selectAction": {"type": "Action.OpenUrl", "url": commit['url']},
+                   "color": "Accent", "isSubtle": False},
+                  {"type": "TextRun", "text": f"  {clean_msg}", "isSubtle": True}
+                ]
+              else:
+                inlines = [{"type": "TextRun", "text": clean_msg, "isSubtle": True}]
+              body_sections.append({
+                "type": "RichTextBlock",
+                "inlines": inlines,
+                "spacing": "Small"
+              })
+
+            if len(commits) > 10:
+              body_sections.append({
+                "type": "TextBlock",
+                "text": f"... and {len(commits) - 10} more commits",
+                "wrap": True,
+                "isSubtle": True,
+                "spacing": "Small"
+              })
+
+            if not shown_commits:
+              body_sections.append({
+                "type": "TextBlock",
+                "text": "No commits found",
+                "wrap": True,
+                "isSubtle": True,
+                "spacing": "Small"
+              })
           
           payload = {
             "type": "message",
@@ -288,7 +316,7 @@ jobs:
           PY
 
           echo "::group::Teams Webhook Details"
-          echo "Endpoint: [REDACTED - stored in TEAMS_WEBHOOK_URL secret]"
+          echo "Endpoint: $TEAMS_WEBHOOK_URL"
           echo "Method: POST"
           echo "Content-Type: application/json"
           echo "::endgroup::"
